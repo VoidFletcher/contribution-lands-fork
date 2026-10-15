@@ -6,6 +6,9 @@
  * year keeps its own tile.
  */
 
+import { paintParkMap, type ParkTextures } from './parkmap';
+import { findPark, mulberry32, parkLayout, type ParkLandmark, type ParkLayout } from './parks';
+
 export interface ContributionData {
   date: string;
   week: number;
@@ -24,6 +27,11 @@ export interface ThemeConfig {
   entities?: Array<{ type: string; count: number; speed: number; flyer?: boolean }>;
   landmarks?: Array<{ sprite: string; name: string }>;
   park_sprites?: string[];
+  central_park_sprites?: {
+    textures: { canopy: string; lawn: string; water: string };
+    trees: string[];
+    landmarks?: Partial<Record<ParkLandmark, string>>;
+  };
   today_sprite?: string;
   today_sprites?: string[];
 }
@@ -46,6 +54,23 @@ export interface Sprite {
 
 export type SpriteSet = Record<number, Sprite[]>;
 
+export interface ParkSprites {
+  textures: ParkTextures;
+  trees: ImageBitmap[];
+  landmarks: Partial<Record<ParkLandmark, ImageBitmap>>;
+}
+
+/** A prop on the park's ground, placed in grid space and depth sorted with the buildings. */
+interface Scenery {
+  gx: number;
+  gy: number;
+  /** World px wide. */
+  width: number;
+  /** Landmark tiles carry their own ground diamond; trees stand on a point. */
+  tile: boolean;
+  sprite: ImageBitmap | null;
+}
+
 export interface RendererOptions {
   motion: boolean;
   /** Overlays (in canvas CSS px, measured from the top) that tall sprites must not hide behind. */
@@ -54,6 +79,8 @@ export interface RendererOptions {
   /** Construction sprites for today's lot: one per level, or a single one used only while today is empty. */
   today?: { date: string; stages: Array<ImageBitmap | null> };
   streaks?: Streaks;
+  /** Sprites for a Central Park over the one long empty stretch, if there is one. */
+  centralPark?: ParkSprites | null;
 }
 
 const TW = 20;
@@ -69,6 +96,10 @@ const BUILDING_WIDTH = 0.95;
 const LOT_MAX_RISE = 7;
 const SHADOW_ALPHA = 0.35;
 const FOREST_WIDTH = 1.25;
+const PARK_LANDMARK_WIDTH = 0.62;
+const PARK_PX_PER_CELL = 48;
+const PARK_MAP_MAX_PX = 4096;
+const BRIDGE_RISE = 3;
 
 const FRAME_MS = 1000 / 30;
 const VIADUCT_HEIGHT = 12;
@@ -123,16 +154,6 @@ interface Flyer {
   colour: string;
 }
 
-function mulberry32(seed: number): () => number {
-  return () => {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 function shade(hex: string, factor: number): string {
   const n = Number.parseInt(hex.replace('#', ''), 16);
   const ch = (shift: number) => Math.max(0, Math.min(255, Math.round(((n >> shift) & 255) * factor)));
@@ -164,6 +185,12 @@ export class IsoRenderer {
   private readonly blocks: Rect[] = [];
   private readonly avenues: number[] = [];
   private readonly streets: number[] = [];
+  /** Grid rectangle of the Central Park district: no street strips or traffic inside it. */
+  private parkRect: Rect | null = null;
+  private parkLayout: ParkLayout | null = null;
+  private parkTextures: ParkTextures | null = null;
+  private parkMap: HTMLCanvasElement | null = null;
+  private scenery: Scenery[] = [];
 
   private motion: boolean;
   private readonly obstacles: RendererOptions['obstacles'];
@@ -220,6 +247,7 @@ export class IsoRenderer {
     this.extentY = this.gyOf(6) + 1 + this.margin;
 
     this.buildCells(contributions, options.today);
+    if (options.centralPark) this.buildPark(contributions, options.centralPark, options.today?.date ?? new Date().toISOString().slice(0, 10));
     this.buildStreets();
     this.buildStreakPaths();
     this.spawnEntities();
@@ -314,6 +342,98 @@ export class IsoRenderer {
     this.cells.sort((a, b) => a.gx + a.gy - (b.gx + b.gy));
   }
 
+  private buildPark(contributions: ContributionData[], park: ParkSprites, today: string) {
+    const span = findPark(contributions, today);
+    if (!span) return;
+
+    const rect = { x0: this.gxOf(span.firstWeek), y0: this.gyOf(0), x1: this.gxOf(span.lastWeek) + 1, y1: this.gyOf(6) + 1 };
+    this.parkRect = rect;
+    this.parkTextures = park.textures;
+    const layout = parkLayout(rect.x1 - rect.x0, rect.y1 - rect.y0);
+    this.parkLayout = layout;
+
+    for (const cell of this.cells) {
+      const { week } = cell.data;
+      if (week < span.firstWeek || week > span.lastWeek || cell.underConstruction) continue;
+      cell.sprite = null;
+      cell.height = 0;
+    }
+
+    for (const t of layout.trees) {
+      const sprite = park.trees[t.variant % park.trees.length] ?? null;
+      if (sprite) this.scenery.push({ gx: rect.x0 + t.x, gy: rect.y0 + t.y, width: TW * t.size, tile: false, sprite });
+    }
+    for (const l of layout.landmarks) {
+      const sprite = park.landmarks[l.role];
+      if (sprite) this.scenery.push({ gx: rect.x0 + l.x, gy: rect.y0 + l.y, width: TW * PARK_LANDMARK_WIDTH, tile: true, sprite });
+    }
+    this.scenery.sort((a, b) => a.gx + a.gy - (b.gx + b.gy));
+  }
+
+  private inPark(c: Cell): boolean {
+    const r = this.parkRect;
+    return r !== null && c.gx >= r.x0 && c.gx + 1 <= r.x1 + 1e-6 && c.gy >= r.y0 && c.gy + 1 <= r.y1 + 1e-6;
+  }
+
+  /** The park's top-down map, projected onto the ground diamond with one affine transform. */
+  private drawParkGround(ctx: CanvasRenderingContext2D) {
+    const rect = this.parkRect;
+    const layout = this.parkLayout;
+    if (!rect || !layout) return;
+    const px = Math.min(PARK_PX_PER_CELL, PARK_MAP_MAX_PX / layout.width);
+    this.parkMap ??= paintParkMap(layout, this.parkTextures, px);
+    const o = this.toScreen(rect.x0, rect.y0);
+    const k = this.scale / px;
+    ctx.save();
+    ctx.transform((TW / 2) * k, (TH / 2) * k, (-TW / 2) * k, (TH / 2) * k, o.x, o.y);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(this.parkMap, 0, 0);
+    ctx.restore();
+  }
+
+  private sceneryRect(s: Scenery) {
+    const p = this.toScreen(s.gx, s.gy);
+    const sprite = s.sprite!;
+    const w = s.width * this.scale;
+    const h = w * (sprite.height / sprite.width);
+    const bottom = p.y + (s.tile ? (s.width / TW) * (TH / 2) * this.scale * 0.5 : w * 0.06);
+    return { x: p.x - w / 2, y: bottom - h, w, h };
+  }
+
+  private drawBridge(ctx: CanvasRenderingContext2D) {
+    const rect = this.parkRect;
+    const layout = this.parkLayout;
+    if (!rect || !layout) return;
+    const { x0, y0, y1 } = layout.bridge;
+    const at = (t: number) => {
+      const p = this.toScreen(rect.x0 + x0, rect.y0 + y0 + (y1 - y0) * t);
+      return { x: p.x, y: p.y - Math.sin(t * Math.PI) * BRIDGE_RISE * this.scale };
+    };
+    const trace = (lift: number) => {
+      ctx.beginPath();
+      for (let i = 0; i <= 16; i++) {
+        const p = at(i / 16);
+        if (i === 0) ctx.moveTo(p.x, p.y - lift * this.scale);
+        else ctx.lineTo(p.x, p.y - lift * this.scale);
+      }
+    };
+    ctx.save();
+    ctx.lineCap = ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(40, 30, 28, 0.55)';
+    ctx.lineWidth = Math.max(1.2, 1.5 * this.scale);
+    trace(-0.4);
+    ctx.stroke();
+    ctx.strokeStyle = '#2f2b30';
+    ctx.lineWidth = Math.max(1, 1.1 * this.scale);
+    trace(1.6);
+    ctx.stroke();
+    ctx.strokeStyle = '#f1ece0';
+    ctx.lineWidth = Math.max(1.2, 0.9 * this.scale);
+    trace(0);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   /** Clips each streak to the visible calendar and maps it to a run of weeks along the front street. */
   private buildStreakPaths() {
     this.streakPaths = [];
@@ -349,6 +469,11 @@ export class IsoRenderer {
     this.avenues.push(half);
     for (let w = BLOCK_WEEKS; w < this.weeks; w += BLOCK_WEEKS) this.avenues.push(this.gxOf(w) - half);
     this.avenues.push(this.extentX - half);
+    const park = this.parkRect;
+    if (park) {
+      const inside = this.avenues.filter((x) => x > park.x0 && x < park.x1);
+      for (const x of inside) this.avenues.splice(this.avenues.indexOf(x), 1);
+    }
     this.streets.push(half, this.gyOf(STREET_BEFORE_DAY) - half, this.extentY - half);
 
     const rows: Array<[number, number]> = [[0, STREET_BEFORE_DAY - 1], [STREET_BEFORE_DAY, 6]];
@@ -373,6 +498,10 @@ export class IsoRenderer {
     for (const c of this.cells) {
       const base = iso(c.gx + 0.5, c.gy + 0.5).y + (c.width / TW) * (TH / 2);
       top = Math.min(top, base - c.height);
+    }
+    for (const s of this.scenery) {
+      const sprite = s.sprite!;
+      top = Math.min(top, iso(s.gx, s.gy).y - s.width * (sprite.height / sprite.width));
     }
     const left = iso(0, this.extentY).x;
     const right = iso(this.extentX, 0).x;
@@ -430,6 +559,7 @@ export class IsoRenderer {
     for (const b of this.blocks) {
       this.fillQuad(ctx, b, this.isCity ? g0 : base);
     }
+    this.drawParkGround(ctx);
 
     if (this.isCity) this.drawRoadMarkings(ctx);
     this.drawShadows(ctx);
@@ -439,6 +569,7 @@ export class IsoRenderer {
     ctx.globalAlpha = 0.35;
     ctx.lineWidth = 0.5;
     for (const c of this.cells) {
+      if (this.inPark(c)) continue;
       this.pathQuad(ctx, { x0: c.gx, y0: c.gy, x1: c.gx + 1, y1: c.gy + 1 });
       ctx.stroke();
     }
@@ -843,12 +974,17 @@ export class IsoRenderer {
       ctx.stroke();
     }
     for (const y of this.streets) {
-      const p = this.toScreen(inset, y);
-      const q = this.toScreen(this.extentX - inset, y);
-      ctx.beginPath();
-      ctx.moveTo(p.x, p.y);
-      ctx.lineTo(q.x, q.y);
-      ctx.stroke();
+      const park = this.parkRect;
+      const crossesPark = park !== null && y > park.y0 && y < park.y1;
+      const runs = crossesPark ? [[inset, park.x0], [park.x1, this.extentX - inset]] : [[inset, this.extentX - inset]];
+      for (const [from, to] of runs) {
+        const p = this.toScreen(from, y);
+        const q = this.toScreen(to, y);
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(q.x, q.y);
+        ctx.stroke();
+      }
     }
     ctx.restore();
   }
@@ -911,9 +1047,15 @@ export class IsoRenderer {
       .map((car) => ({ car, ...this.carCentre(car) }))
       .sort((a, b) => a.gx + a.gy - (b.gx + b.gy));
     let ci = 0;
+    let si = 0;
+    const drawScenery = (s: Scenery) => {
+      const r = this.sceneryRect(s);
+      ctx.drawImage(this.selected ? this.mutedSprite(s.sprite!) : s.sprite!, r.x, r.y, r.w, r.h);
+    };
 
     for (const cell of this.cells) {
       const depth = cell.gx + cell.gy + 1;
+      while (si < this.scenery.length && this.scenery[si].gx + this.scenery[si].gy < depth) drawScenery(this.scenery[si++]);
       while (ci < cars.length && cars[ci].gx + cars[ci].gy < depth) {
         this.drawCar(cars[ci].car, cars[ci].gx, cars[ci].gy);
         ci++;
@@ -930,7 +1072,9 @@ export class IsoRenderer {
         ctx.drawImage(cell.sprite, r.x, r.y, r.w, r.h);
       }
     }
+    for (; si < this.scenery.length; si++) drawScenery(this.scenery[si]);
     for (; ci < cars.length; ci++) this.drawCar(cars[ci].car, cars[ci].gx, cars[ci].gy);
+    this.drawBridge(ctx);
     this.drawViaduct();
 
     for (const f of this.flyers) this.drawFlyer(f);
@@ -972,10 +1116,12 @@ export class IsoRenderer {
         const lines = alongX ? this.streets : this.avenues;
         const fixed = lines[Math.floor(rng() * lines.length)];
         const span = alongX ? this.extentX : this.extentY;
+        let pos = STREET / 2 + rng() * (span - STREET);
+        if (alongX && this.inParkRow(fixed) && pos > this.parkRect!.x0 && pos < this.parkRect!.x1) pos = this.parkRect!.x0;
         this.cars.push({
           alongX,
           fixed,
-          pos: STREET / 2 + rng() * (span - STREET),
+          pos,
           dir: rng() < 0.5 ? 1 : -1,
           speed: 0.9 + rng() * 0.6,
           colour: hasTaxis && rng() < 0.45 ? TAXI_YELLOW : CAR_COLOURS[Math.floor(rng() * CAR_COLOURS.length)],
@@ -1012,9 +1158,20 @@ export class IsoRenderer {
       : { gx: car.fixed - lane, gy: car.pos };
   }
 
+  private inParkRow(y: number): boolean {
+    return this.parkRect !== null && y > this.parkRect.y0 && y < this.parkRect.y1;
+  }
+
   private stepCar(car: Car, dt: number) {
     const crossings = car.alongX ? this.avenues : this.streets;
     const next = car.pos + car.dir * car.speed * dt;
+    const park = this.parkRect;
+    if (park && car.alongX && this.inParkRow(car.fixed)) {
+      if ((car.pos <= park.x0 && next > park.x0) || (car.pos >= park.x1 && next < park.x1)) {
+        car.dir = car.dir === 1 ? -1 : 1;
+        return;
+      }
+    }
     const lo = Math.min(car.pos, next);
     const hi = Math.max(car.pos, next);
     const hit = crossings.find((c) => c > lo && c <= hi && c !== car.lastTurn);

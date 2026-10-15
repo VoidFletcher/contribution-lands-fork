@@ -5,7 +5,8 @@
  * for the lazily rendered calendar, then inject the canvas, stats and toggle.
  */
 
-import { IsoRenderer, type ContributionData, type Sprite, type SpriteSet, type ThemeConfig } from './renderer';
+import { PARK_LANDMARKS } from './parks';
+import { IsoRenderer, type ContributionData, type ParkSprites, type Sprite, type SpriteSet, type ThemeConfig } from './renderer';
 import { addDays, averagePerDay, computeStats, fetchDays, reconcileStart, todayKey, tooltipCounts, extendWithHistory, formatDate, formatRange, longestStreak, currentStreak, type ContributionStats, type Streak } from './stats';
 import contentCss from './content.css?inline';
 
@@ -18,9 +19,10 @@ interface Settings {
   motion: boolean;
   showStats: boolean;
   scale: Scale;
+  centralPark: boolean;
 }
 
-const DEFAULTS: Settings = { viewSetting: 'cubes', motion: true, showStats: true, scale: 'absolute' };
+const DEFAULTS: Settings = { viewSetting: 'cubes', motion: true, showStats: true, scale: 'absolute', centralPark: false };
 
 /**
  * Building height from the day's count on one scale for everyone. GitHub's own levels
@@ -131,7 +133,26 @@ async function spriteFiles(themeId: string): Promise<Record<string, string[]>> {
   return found;
 }
 
-async function loadTheme(): Promise<{ config: ThemeConfig; sprites: SpriteSet; todayStages: Array<ImageBitmap | null> }> {
+async function loadParkSprites(themeId: string, config: ThemeConfig): Promise<ParkSprites | null> {
+  const names = config.central_park_sprites;
+  if (!names) return null;
+  const load = async (name: string | undefined) => (name ? loadBitmap(`themes/${themeId}/sprites/${name}`) : null);
+  const [canopy, lawn, water, trees, landmarks] = await Promise.all([
+    load(names.textures.canopy),
+    load(names.textures.lawn),
+    load(names.textures.water),
+    Promise.all(names.trees.map(load)),
+    Promise.all(PARK_LANDMARKS.map(async (role) => [role, await load(names.landmarks?.[role])] as const)),
+  ]);
+  if (!canopy || !lawn || !water) return null;
+  return {
+    textures: { canopy, lawn, water },
+    trees: trees.filter((b): b is ImageBitmap => b !== null),
+    landmarks: Object.fromEntries(landmarks.filter(([, b]) => b !== null)),
+  };
+}
+
+async function loadTheme(): Promise<{ config: ThemeConfig; sprites: SpriteSet; todayStages: Array<ImageBitmap | null>; park: ParkSprites | null }> {
   let themeId = 'city-nyc';
   try {
     const result = await chrome.storage.sync.get(POPUP_KEY);
@@ -162,7 +183,8 @@ async function loadTheme(): Promise<{ config: ThemeConfig; sprites: SpriteSet; t
   );
   const stageNames = config.today_sprites ?? (config.today_sprite ? [config.today_sprite] : []);
   const todayStages = await Promise.all(stageNames.map((name) => loadBitmap(`themes/${themeId}/sprites/${name}`)));
-  return { config, sprites, todayStages };
+  const park = settings.centralPark ? await loadParkSprites(themeId, config) : null;
+  return { config, sprites, todayStages, park };
 }
 
 // ============================================================
@@ -495,7 +517,7 @@ async function generate() {
     if (!data) return;
     const range = calendarRange();
 
-    const { config, sprites, todayStages } = await loadTheme();
+    const { config, sprites, todayStages, park } = await loadTheme();
     if (document.querySelector('.cl-contributions-wrapper') || !calendarGraph.isConnected) return;
 
     const wrapper = document.createElement('div');
@@ -516,6 +538,7 @@ async function generate() {
       today: { date: todayKey(), stages: todayStages },
       streaks: { longest: stats.longest, current: stats.current },
       motion: settings.motion && !reducedMotion,
+      centralPark: park,
       obstacles: () => {
         const panel = wrapper.querySelector<HTMLElement>('.cl-panel-top');
         if (!panel || getComputedStyle(panel).position !== 'absolute' || panel.offsetParent === null) return [];
@@ -601,6 +624,11 @@ function injectCss() {
         settings.showStats = Boolean(changes.showStats.newValue);
         if (box) applyStatsVisibility(box);
         renderer?.relayout();
+      }
+      if (changes.centralPark) {
+        settings.centralPark = Boolean(changes.centralPark.newValue);
+        teardown();
+        void generate();
       }
       if (changes.scale) {
         settings.scale = changes.scale.newValue === 'relative' ? 'relative' : 'absolute';
